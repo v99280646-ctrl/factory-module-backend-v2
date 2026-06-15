@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import { env } from "../config/env.js";
 import { FactoryModel } from "../models/factory.model.js";
 import { MembershipModel } from "../models/membership.model.js";
+import { StaffModel } from "../models/staff.model.js";
 import { UserModel } from "../models/user.model.js";
 import type { AuthMembership, AuthUser } from "../types/auth.js";
 import { normalizePagePermissions } from "./staff-membership.service.js";
@@ -138,13 +139,21 @@ export async function buildSessionForUser(userId: string, isNewUser = false): Pr
 export async function upsertGoogleUser(input: { email: string; name: string; googleId?: string }) {
   const email = normalizeEmail(input.email);
   const existing = await UserModel.findOne({ email });
+
+  // Check if the user is registered as staff in any factory
+  const isStaff = await StaffModel.exists({ email });
+
+  const targetRole = isSuperAdminEmail(email)
+    ? "super_admin"
+    : isStaff
+      ? "staff"
+      : "admin";
+
   if (existing) {
     existing.name = input.name;
     if (input.googleId) existing.googleId = input.googleId;
-    if (isSuperAdminEmail(email)) {
-      existing.globalRole = "super_admin";
-    } else if (isAdminEmail(email) && existing.globalRole !== "super_admin") {
-      existing.globalRole = "admin";
+    if (existing.globalRole !== "super_admin") {
+      existing.globalRole = targetRole;
     }
     existing.active = true;
     await existing.save();
@@ -155,7 +164,7 @@ export async function upsertGoogleUser(input: { email: string; name: string; goo
     name: input.name,
     email,
     googleId: input.googleId,
-    globalRole: isSuperAdminEmail(email) ? "super_admin" : isAdminEmail(email) ? "admin" : "staff",
+    globalRole: targetRole,
     active: true,
   });
   return { user: created, isNewUser: true };

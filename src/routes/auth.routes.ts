@@ -39,28 +39,25 @@ authRoutes.post("/google", async (req, res) => {
   try {
     const googleUser = await verifyGoogleCredential(parsed.data.credential);
     const { user, isNewUser } = await upsertGoogleUser(googleUser);
-    // If this is a brand new user, only create an initial factory and membership
-    // when the system has no factories yet (first user signing up). This avoids
-    // creating a new factory for every staff member who signs in via Google.
-    if (isNewUser) {
-      const existingCount = await FactoryModel.countDocuments();
-      if (existingCount === 0) {
-        const baseName = String(user.name || user.email || "My Factory").slice(0, 64);
-        const code = baseName
-          .replace(/[^a-z0-9]+/gi, "")
-          .slice(0, 8)
-          .toUpperCase() || `F${Date.now().toString().slice(-6)}`;
+    // If this is a brand new admin user, create an initial factory and membership.
+    // This ensures every independent admin gets their own workspace, while
+    // staff users (who are handled by syncUserStaffMemberships) do not.
+    if (isNewUser && user.globalRole === "admin") {
+      const baseName = String(user.name || user.email || "My Factory").slice(0, 64);
+      const code = baseName
+        .replace(/[^a-z0-9]+/gi, "")
+        .slice(0, 8)
+        .toUpperCase() || `F${Date.now().toString().slice(-6)}`;
 
-        const createdFactory = await FactoryModel.create({ name: baseName, code });
-        await MembershipModel.create({
-          userId: String(user._id),
-          factoryId: createdFactory._id,
-          role: "admin",
-          accessLevel: "full",
-          pagePermissions: FULL_PAGE_PERMISSIONS,
-          active: true,
-        });
-      }
+      const createdFactory = await FactoryModel.create({ name: baseName, code });
+      await MembershipModel.create({
+        userId: String(user._id),
+        factoryId: createdFactory._id,
+        role: "admin",
+        accessLevel: "full",
+        pagePermissions: FULL_PAGE_PERMISSIONS,
+        active: true,
+      });
     }
 
     if (user.globalRole === "staff") {
@@ -68,6 +65,7 @@ authRoutes.post("/google", async (req, res) => {
     }
 
     const session = await buildSessionForUser(String(user._id), isNewUser);
+    console.log("session", session);
     ok(res, session);
   } catch (error) {
     return fail(
