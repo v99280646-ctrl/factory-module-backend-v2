@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Request, Response, Router } from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth.middleware.js";
@@ -336,7 +336,7 @@ staffRoutes.get("/", requireRole("super_admin", "admin", "staff"), requirePagePe
   }
 });
 
-staffRoutes.post("/", requirePagePermission("staff", "add"), async (req, res) => {
+staffRoutes.post("/", requirePagePermission("staff", "add"), async (req: Request, res: Response) => {
   try {
     const parsed = staffSchema.safeParse(req.body);
     if (!parsed.success) return fail(res, 400, "Invalid staff payload");
@@ -360,7 +360,7 @@ staffRoutes.post("/", requirePagePermission("staff", "add"), async (req, res) =>
   }
 });
 
-staffRoutes.patch("/:id/status", requirePagePermission("staff", "update"), async (req, res) => {
+staffRoutes.patch("/:id/status", requirePagePermission("staff", "update"), async (req: Request, res: Response) => {
   const parsed = z.object({ active: z.boolean() }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, "Invalid staff status payload");
 
@@ -373,7 +373,7 @@ staffRoutes.patch("/:id/status", requirePagePermission("staff", "update"), async
   ok(res, mapStaff(updated), "Staff status updated");
 });
 
-staffRoutes.patch("/:id", requirePagePermission("staff", "edit"), async (req, res) => {
+staffRoutes.patch("/:id", requirePagePermission("staff", "edit"), async (req: Request, res: Response) => {
   try {
     const parsed = staffSchema.partial().safeParse(req.body);
     if (!parsed.success) return fail(res, 400, "Invalid staff payload");
@@ -395,7 +395,7 @@ staffRoutes.patch("/:id", requirePagePermission("staff", "edit"), async (req, re
   }
 });
 
-staffRoutes.delete("/:id", requirePagePermission("staff", "delete"), async (req, res) => {
+staffRoutes.delete("/:id", requirePagePermission("staff", "delete"), async (req: Request, res: Response) => {
   try {
     const filter = req.user?.globalRole === "super_admin" ? { _id: req.params.id } : { _id: req.params.id, factoryId: req.factoryId };
     const deleted = await StaffModel.findOneAndDelete(filter).lean();
