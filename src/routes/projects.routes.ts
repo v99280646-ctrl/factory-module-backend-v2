@@ -5,6 +5,8 @@ import { requireFactoryScope } from "../middleware/factory-scope.middleware.js";
 import { requireRole } from "../middleware/role.middleware.js";
 import { CustomerModel } from "../models/customer.model.js";
 import { ProjectModel } from "../models/project.model.js";
+import { StaffModel } from "../models/staff.model.js";
+import { StaffUsageLogModel } from "../models/staff-usage-log.model.js";
 import { fail, ok } from "../utils/api-response.js";
 import { requirePagePermission } from "../middleware/page-permission.middleware.js";
 import { StockModel } from "../models/stock.model.js";
@@ -96,6 +98,7 @@ const stageUsageSchema = z.object({
   role: z.string().optional(),
   staffName: z.string().optional(),
   note: z.string().optional(),
+  stageStatus: z.string().optional(),
   materials: z
     .array(
       z.object({
@@ -103,7 +106,7 @@ const stageUsageSchema = z.object({
         quantityUsed: z.number().positive(),
       }),
     )
-    .min(1)
+    .default([])
     .refine(
       (materials) =>
         new Set(materials.map((material) => material.projectMaterialId))
@@ -252,6 +255,24 @@ function stageTotals(materials: any[]) {
       0,
     ),
   };
+}
+
+async function resolveStaffContext(input: {
+  factoryId?: string | null;
+  userId?: string;
+  staffName?: string;
+}) {
+  if (!input.factoryId) return null;
+
+  const clauses: Array<Record<string, unknown>> = [];
+  if (input.userId) clauses.push({ userId: input.userId });
+  if (input.staffName?.trim()) clauses.push({ name: input.staffName.trim() });
+  if (!clauses.length) return null;
+
+  return StaffModel.findOne({
+    factoryId: input.factoryId,
+    $or: clauses,
+  }).lean();
 }
 
 projectsRoutes.get(
@@ -502,7 +523,18 @@ projectsRoutes.post(
         usage.quantityUsed,
       ]),
     );
+    const stageStatus = parsed.data.stageStatus?.trim();
+    const hasStatusUpdate = Boolean(stageStatus);
     const stockDeductions = new Map<string, number>();
+    const hasMaterialUsage = parsed.data.materials.length > 0;
+
+    if (!hasMaterialUsage && !hasStatusUpdate && !parsed.data.note?.trim()) {
+      return fail(
+        res,
+        400,
+        "Add material usage, update the stage status, or add a note",
+      );
+    }
 
     const unknownUsage = parsed.data.materials.find(
       (usage) =>
@@ -586,6 +618,7 @@ projectsRoutes.post(
       role: parsed.data.role,
       staffName: parsed.data.staffName,
       note: parsed.data.note,
+      stageStatus: stageStatus || undefined,
       createdAt: new Date(),
       materials: parsed.data.materials.map((usage) => {
         const material = stageMaterials.find(
@@ -607,6 +640,7 @@ projectsRoutes.post(
       ...stages[stageIndex],
       materials: stageMaterials,
       ...totals,
+      staffStatus: stageStatus || stages[stageIndex].staffStatus || "In progress",
       usageHistory: [usageRecord, ...(stages[stageIndex].usageHistory ?? [])],
       lastUpdate: usageRecord,
     };
@@ -620,6 +654,38 @@ projectsRoutes.post(
         )
       : project.progress;
     await project.save();
+    const staffContext = await resolveStaffContext({
+      factoryId: req.factoryId,
+      userId: req.user?.id,
+      staffName: parsed.data.staffName,
+    });
+    await StaffUsageLogModel.findOneAndUpdate(
+      {
+        factoryId: req.factoryId,
+        sourceRecordId: usageRecord.id,
+      },
+      {
+        factoryId: req.factoryId,
+        staffId: staffContext?._id,
+        userId: req.user?.id,
+        staffName: parsed.data.staffName || staffContext?.name || "Staff",
+        staffEmail: staffContext?.email || "",
+        staffRole: parsed.data.role || staffContext?.role || "",
+        projectId: project._id,
+        projectCode: project.code,
+        projectName: project.name,
+        stageName,
+        note: parsed.data.note || "",
+        totalQuantityUsed: usageRecord.materials.reduce(
+          (sum, material) => sum + Number(material.quantityUsed ?? 0),
+          0,
+        ),
+        sourceRecordId: usageRecord.id,
+        activityAt: usageRecord.createdAt,
+        materials: usageRecord.materials,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
     ok(res, mapProject(project, req.user?.id), "Project usage updated");
   },
 );

@@ -1,10 +1,12 @@
 import { Router } from "express";
+import mongoose from "mongoose";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { requireFactoryScope } from "../middleware/factory-scope.middleware.js";
 import { requireRole } from "../middleware/role.middleware.js";
 import { ProjectModel } from "../models/project.model.js";
 import { StaffModel } from "../models/staff.model.js";
+import { StaffUsageLogModel } from "../models/staff-usage-log.model.js";
 import { PAGE_NAMES, PAGE_ACTIONS, DEFAULT_PAGE_PERMISSIONS, FULL_PAGE_PERMISSIONS } from "../models/membership.model.js";
 import { fail, ok } from "../utils/api-response.js";
 import { requirePagePermission } from "../middleware/page-permission.middleware.js";
@@ -35,6 +37,9 @@ const activityQuerySchema = z.object({
     .string()
     .regex(/^\d{4}-\d{2}$/u, "Month must be in YYYY-MM format")
     .optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  search: z.string().trim().optional(),
 });
 
 /**
@@ -68,7 +73,87 @@ function monthBounds(month?: string) {
   if (!year || !monthNumber) return null;
   const start = new Date(Date.UTC(year, monthNumber - 1, 1, 0, 0, 0, 0));
   const end = new Date(Date.UTC(year, monthNumber, 1, 0, 0, 0, 0));
-  return { start, end };
+
+  // Previous month bounds for comparison
+  const prevStart = new Date(Date.UTC(year, monthNumber - 2, 1, 0, 0, 0, 0));
+  const prevEnd = new Date(Date.UTC(year, monthNumber - 1, 1, 0, 0, 0, 0));
+
+  return { start, end, prevStart, prevEnd };
+}
+
+async function backfillUsageLogsForStaff(staff: any, factoryId?: string) {
+  if (!factoryId) return;
+
+  const targetUserId = staff.userId ? String(staff.userId) : "";
+  const targetEmail = String(staff.email || "").trim().toLowerCase();
+  const targetName = String(staff.name || "").trim().toLowerCase();
+  if (!targetUserId && !targetEmail && !targetName) return;
+
+  const projects = await ProjectModel.find({ factoryId }).lean();
+  const ops: Array<Record<string, unknown>> = [];
+
+  const matchesStaff = (entry: { userId?: unknown; staffName?: unknown }) => {
+    const entryUserId = entry.userId ? String(entry.userId) : "";
+    const entryName = String(entry.staffName || "").trim().toLowerCase();
+    return Boolean(
+      (targetUserId && entryUserId && targetUserId === entryUserId) ||
+        (targetName && entryName && targetName === entryName),
+    );
+  };
+
+  projects.forEach((project: any) => {
+    (project.workflowStages ?? []).forEach((stage: any) => {
+      (stage?.usageHistory ?? []).forEach((entry: any) => {
+        if (!entry?.id || !matchesStaff({ userId: entry.userId, staffName: entry.staffName })) {
+          return;
+        }
+
+        const materials = (entry.materials ?? []).map((material: any) => ({
+          projectMaterialId: String(material.projectMaterialId || ""),
+          materialName: String(material.materialName || "Material"),
+          materialType: String(material.materialType || ""),
+          thickness: String(material.thickness || ""),
+          quantityUsed: Number(material.quantityUsed || 0),
+          unit: String(material.unit || "units"),
+        }));
+
+        ops.push({
+          updateOne: {
+            filter: {
+              factoryId,
+              sourceRecordId: String(entry.id),
+            },
+            update: {
+              $setOnInsert: {
+                factoryId,
+                staffId: staff._id,
+                userId: entry.userId || staff.userId || undefined,
+                staffName: entry.staffName || staff.name || "Staff",
+                staffEmail: staff.email || "",
+                staffRole: entry.role || staff.role || "",
+                projectId: project._id,
+                projectCode: project.code,
+                projectName: project.name,
+                stageName: stage.name || "",
+                note: entry.note || "",
+                totalQuantityUsed: materials.reduce((sum: number, material: any) => {
+                  return sum + Number(material.quantityUsed || 0);
+                }, 0),
+                sourceRecordId: String(entry.id),
+                activityAt: entry.createdAt ? new Date(entry.createdAt) : new Date(project.updatedAt || Date.now()),
+                materials,
+              },
+            },
+            upsert: true,
+          },
+        });
+      });
+    });
+  });
+
+  if (ops.length) {
+    await StaffUsageLogModel.bulkWrite(ops as any[], { ordered: false });
+  }
 }
 
 staffRoutes.get(
@@ -86,176 +171,154 @@ staffRoutes.get(
           : { _id: req.params.id, factoryId: req.factoryId };
       const staff = await StaffModel.findOne(filter).lean();
       if (!staff) return fail(res, 404, "Staff not found");
+      await backfillUsageLogsForStaff(staff, req.factoryId);
 
+      const page = parsedQuery.data.page ?? 1;
+      const limit = parsedQuery.data.limit ?? 10;
       const range = monthBounds(parsedQuery.data.month);
-      const projectFilter = req.user?.globalRole === "super_admin" ? {} : { factoryId: req.factoryId };
-      const projects = await ProjectModel.find(projectFilter).lean();
+      const search = parsedQuery.data.search?.trim();
 
-      const targetUserId = staff.userId ? String(staff.userId) : "";
-      const targetEmail = String(staff.email || "").trim().toLowerCase();
-      const targetName = String(staff.name || "").trim().toLowerCase();
-
-      const records: Array<{
-        id: string;
-        type: "usage" | "configuration" | "assignment";
-        date: string;
-        projectId: string;
-        projectCode: string;
-        projectName: string;
-        stageName?: string;
-        role?: string;
-        note?: string;
-        materialCount?: number;
-        materials?: Array<{
-          projectMaterialId?: string;
-          materialName: string;
-          materialType?: string;
-          thickness?: string;
-          quantityUsed?: number;
-          requiredQuantity?: number;
-          completedQuantity?: number;
-          unit?: string;
-        }>;
-      }> = [];
-
-      const inRange = (value?: unknown) => {
-        if (!value) return !range;
-        const date = new Date(String(value));
-        if (Number.isNaN(date.getTime())) return false;
-        if (!range) return true;
-        return date >= range.start && date < range.end;
+      const baseFilter: Record<string, any> = {
+        factoryId: new mongoose.Types.ObjectId(String(req.factoryId)),
       };
 
-      const matchesStaff = (entry: {
-        userId?: unknown;
-        staffName?: unknown;
-        email?: unknown;
-      }) => {
-        const entryUserId = entry.userId ? String(entry.userId) : "";
-        const entryName = String(entry.staffName || "").trim().toLowerCase();
-        const entryEmail = String(entry.email || "").trim().toLowerCase();
-        return Boolean(
-          (targetUserId && entryUserId && targetUserId === entryUserId) ||
-            (targetEmail && entryEmail && targetEmail === entryEmail) ||
-            (targetName && entryName && targetName === entryName),
-        );
-      };
+      const staffMatch: Array<Record<string, any>> = [];
+      if (staff._id) staffMatch.push({ staffId: new mongoose.Types.ObjectId(String(staff._id)) });
+      if (staff.userId) staffMatch.push({ userId: new mongoose.Types.ObjectId(String(staff.userId)) });
+      if (staff.email) staffMatch.push({ staffEmail: String(staff.email).trim().toLowerCase() });
+      if (staff.name) staffMatch.push({ staffName: staff.name });
 
-      projects.forEach((project: any) => {
-        const projectId = String(project._id);
-        const projectCode = String(project.code || "");
-        const projectName = String(project.name || "");
-
-        const assignedStaffIds = (project.assignedStaffIds ?? []).map(String);
-        if ((!range || inRange(project.updatedAt)) && targetUserId && assignedStaffIds.includes(targetUserId)) {
-          records.push({
-            id: `assignment-${projectId}`,
-            type: "assignment",
-            date: new Date(project.updatedAt || project.createdAt || Date.now()).toISOString(),
-            projectId,
-            projectCode,
-            projectName,
-            role: String(staff.role || "Assigned"),
-            note: "Assigned to project",
-          });
-        }
-
-        (project.workflowStages ?? []).forEach((stage: any) => {
-          const stageName = String(stage.name || "");
-          const configuredBy = stage?.configuredBy;
-          if (
-            configuredBy &&
-            matchesStaff({
-              userId: configuredBy.userId,
-              staffName: configuredBy.staffName,
-            }) &&
-            inRange(configuredBy.configuredAt)
-          ) {
-            records.push({
-              id: `configuration-${projectId}-${stageName}-${configuredBy.configuredAt || ""}`,
-              type: "configuration",
-              date: new Date(configuredBy.configuredAt || project.updatedAt || Date.now()).toISOString(),
-              projectId,
-              projectCode,
-              projectName,
-              stageName,
-              role: String(configuredBy.role || stageName || "Configured"),
-              note: "Configured stage materials",
-              materialCount: Array.isArray(stage.materials) ? stage.materials.length : 0,
-              materials: (stage.materials ?? []).map((material: any) => ({
-                projectMaterialId: String(material.projectMaterialId || ""),
-                materialName: String(material.materialName || "Material"),
-                materialType: String(material.materialType || ""),
-                thickness: String(material.thickness || ""),
-                requiredQuantity: Number(material.requiredQuantity || 0),
-                completedQuantity: Number(material.completedQuantity || 0),
-                unit: String(material.unit || "units"),
-              })),
-            });
-          }
-
-          (stage?.usageHistory ?? []).forEach((entry: any) => {
-            if (
-              matchesStaff({
-                userId: entry.userId,
-                staffName: entry.staffName,
-              }) &&
-              inRange(entry.createdAt)
-            ) {
-              records.push({
-                id: String(entry.id || `usage-${projectId}-${stageName}-${entry.createdAt || ""}`),
-                type: "usage",
-                date: new Date(entry.createdAt || project.updatedAt || Date.now()).toISOString(),
-                projectId,
-                projectCode,
-                projectName,
-                stageName,
-                role: String(entry.role || stageName || ""),
-                note: String(entry.note || ""),
-                materialCount: Array.isArray(entry.materials) ? entry.materials.length : 0,
-                materials: (entry.materials ?? []).map((material: any) => ({
-                  projectMaterialId: String(material.projectMaterialId || ""),
-                  materialName: String(material.materialName || "Material"),
-                  materialType: String(material.materialType || ""),
-                  thickness: String(material.thickness || ""),
-                  quantityUsed: Number(material.quantityUsed || 0),
-                  unit: String(material.unit || "units"),
-                })),
-              });
-            }
-          });
-        });
+      if (!staffMatch.length) return ok(res, {
+        staff: mapStaff(staff),
+        month: parsedQuery.data.month || null,
+        search: search || "",
+        summary: {
+          totalRecords: 0,
+          totalUsageEntries: 0,
+          totalConfiguredStages: 0,
+          totalAssignedProjects: 0,
+          totalMaterialsUsed: 0,
+          totalLastMonthMaterialsUsed: 0,
+        },
+        pagination: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 0,
+          hasNext: false,
+          hasPrev: false,
+        },
+        records: [],
       });
 
-      records.sort((a, b) => +new Date(b.date) - +new Date(a.date));
+      baseFilter.$or = staffMatch;
 
+      if (range) {
+        baseFilter.activityAt = { $gte: range.start, $lt: range.end };
+      }
+
+      if (search) {
+        const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu");
+        baseFilter.$and = [
+          {
+            $or: [
+              { projectCode: regex },
+              { projectName: regex },
+              { stageName: regex },
+              { note: regex },
+              { "materials.materialName": regex },
+              { "materials.materialType": regex },
+              { "materials.thickness": regex },
+            ],
+          },
+        ];
+      }
+
+      const summaryFilter = { factoryId: baseFilter.factoryId, $or: baseFilter.$or };
+
+      const [total, summaryAggregation, rows] = await Promise.all([
+        StaffUsageLogModel.countDocuments(baseFilter),
+        StaffUsageLogModel.aggregate([
+          { $match: summaryFilter },
+          {
+            $facet: {
+              current: [
+                { $match: range ? { activityAt: { $gte: range.start, $lt: range.end } } : {} },
+                {
+                  $group: {
+                    _id: null,
+                    totalRecords: { $sum: 1 },
+                    totalMaterialsUsed: { $sum: { $ifNull: ["$totalQuantityUsed", 0] } },
+                    projects: { $addToSet: "$projectId" },
+                  },
+                },
+              ],
+              previous: range ? [
+                { $match: { activityAt: { $gte: range.prevStart, $lt: range.prevEnd } } },
+                {
+                  $group: {
+                    _id: null,
+                    totalMaterialsUsed: { $sum: { $ifNull: ["$totalQuantityUsed", 0] } },
+                  },
+                }
+              ] : []
+            }
+          },
+        ]),
+        StaffUsageLogModel.find(baseFilter)
+          .sort({ activityAt: -1, createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .lean(),
+      ]);
+
+      const facets = summaryAggregation[0];
+      const current = facets?.current[0];
+      const previous = facets?.previous[0];
+
+      const totalPages = total ? Math.ceil(total / limit) : 0;
       const summary = {
-        totalRecords: records.length,
-        totalUsageEntries: records.filter((record) => record.type === "usage").length,
-        totalConfiguredStages: records.filter((record) => record.type === "configuration").length,
-        totalAssignedProjects: new Set(
-          records
-            .filter((record) => record.type === "assignment")
-            .map((record) => record.projectId),
-        ).size,
-        totalMaterialsUsed: records
-          .filter((record) => record.type === "usage")
-          .reduce(
-            (sum, record) =>
-              sum +
-              (record.materials ?? []).reduce(
-                (inner, material) => inner + Number(material.quantityUsed || 0),
-                0,
-              ),
-            0,
-          ),
+        totalRecords: current?.totalRecords ?? 0,
+        totalUsageEntries: current?.totalRecords ?? 0,
+        totalConfiguredStages: 0,
+        totalAssignedProjects: Array.isArray(current?.projects) ? current.projects.length : 0,
+        totalMaterialsUsed: current?.totalMaterialsUsed ?? 0,
+        totalLastMonthMaterialsUsed: previous?.totalMaterialsUsed ?? 0,
       };
 
       ok(res, {
         staff: mapStaff(staff),
         month: parsedQuery.data.month || null,
+        search: search || "",
         summary,
-        records,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+          hasNext: page < totalPages,
+          hasPrev: page > 1,
+        },
+        records: rows.map((row: any) => ({
+          id: String(row._id),
+          type: "usage" as const,
+          date: row.activityAt,
+          projectId: String(row.projectId),
+          projectCode: row.projectCode,
+          projectName: row.projectName,
+          stageName: row.stageName || "",
+          role: row.staffRole || "",
+          note: row.note || "",
+          materialCount: Number(row.totalQuantityUsed ?? 0),
+          materials: (row.materials ?? []).map((material: any) => ({
+            projectMaterialId: String(material.projectMaterialId || ""),
+            materialName: material.materialName || "Material",
+            materialType: material.materialType || "",
+            thickness: material.thickness || "",
+            quantityUsed: Number(material.quantityUsed || 0),
+            unit: material.unit || "units",
+          })),
+        })),
       });
     } catch (error: any) {
       fail(res, error.name === "CastError" ? 400 : 500, error.message || "Failed to load staff activity");
