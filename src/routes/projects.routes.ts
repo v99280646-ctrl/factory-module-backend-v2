@@ -103,7 +103,7 @@ const stageUsageSchema = z.object({
     .array(
       z.object({
         projectMaterialId: z.string().min(1),
-        quantityUsed: z.number().positive(),
+        quantityUsed: z.number().nonnegative(),
       }),
     )
     .default([])
@@ -257,6 +257,118 @@ function stageTotals(materials: any[]) {
   };
 }
 
+function normalizeVariant(value: string) {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function normalizeThickness(value: string) {
+  const compact = value.trim().replace(/\s+/g, "").toLowerCase();
+  const millimeters = compact.match(/^(\d+(?:\.\d+)?)(?:mm)?$/);
+  return millimeters ? `${Number(millimeters[1])}mm` : compact;
+}
+
+function generateStockCode(type: string, thickness: string) {
+  const cleaned = `${type}${thickness}`
+    .replace(/[^a-z0-9]+/gi, "")
+    .slice(0, 10)
+    .toUpperCase();
+  return `${cleaned || "STK"}${Date.now().toString().slice(-6)}`;
+}
+
+async function attachStockItemsToProjectMaterials(factoryId: string, materials: any[] = []) {
+  const syncedMaterials = [];
+
+  for (const material of materials) {
+    if (material.source !== "new-stock") {
+      syncedMaterials.push(material);
+      continue;
+    }
+
+    const type = String(material.materialType || material.materialName || "").trim();
+    const thickness = String(material.thickness || "").trim();
+    const quantity = Number(material.quantity ?? 0);
+    const unit = String(material.unit || "sheets").trim() || "sheets";
+
+    if (!type || !thickness || quantity <= 0) {
+      syncedMaterials.push(material);
+      continue;
+    }
+
+    const typeKey = normalizeVariant(type);
+    const thicknessKey = normalizeThickness(thickness);
+    let stockItem = await StockModel.findOne({
+      factoryId,
+      typeKey,
+      thicknessKey,
+    });
+
+    if (stockItem) {
+      stockItem.quantity = Number(stockItem.quantity ?? 0) + quantity;
+      if (!stockItem.unit) stockItem.unit = unit;
+      if (!stockItem.material) stockItem.material = material.materialName || type;
+      if (!stockItem.name) stockItem.name = material.materialName || type;
+      await stockItem.save();
+    } else {
+      stockItem = await StockModel.create({
+        factoryId,
+        code: generateStockCode(type, thickness),
+        name: material.materialName || type,
+        material: material.materialName || type,
+        category: type,
+        type,
+        thickness,
+        typeKey,
+        thicknessKey,
+        quantity,
+        unit,
+      });
+    }
+
+    syncedMaterials.push({
+      ...material,
+      stockItemId: stockItem._id,
+      materialName: material.materialName || `${type} ${thickness}`,
+      materialType: type,
+      thickness,
+      unit,
+    });
+  }
+
+  return syncedMaterials;
+}
+
+function dayBounds(date = new Date()) {
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { start, end };
+}
+
+function isSameDayUsageRecord(entry: any, input: {
+  userId?: string;
+  staffName?: string;
+  start: Date;
+  end: Date;
+}) {
+  const createdAt = entry?.createdAt ? new Date(entry.createdAt) : null;
+  if (!createdAt || Number.isNaN(createdAt.getTime())) return false;
+  if (createdAt < input.start || createdAt >= input.end) return false;
+
+  if (input.userId && entry?.userId) {
+    return String(entry.userId) === input.userId;
+  }
+
+  if (input.staffName?.trim() && entry?.staffName) {
+    return (
+      String(entry.staffName).trim().toLowerCase() ===
+      input.staffName.trim().toLowerCase()
+    );
+  }
+
+  return false;
+}
+
 async function resolveStaffContext(input: {
   factoryId?: string | null;
   userId?: string;
@@ -365,11 +477,18 @@ projectsRoutes.post(
 
       const code =
         parsed.data.code || `P${Date.now().toString().slice(-8).toUpperCase()}`;
+      const materials = req.factoryId
+        ? await attachStockItemsToProjectMaterials(
+            req.factoryId,
+            parsed.data.materials ?? [],
+          )
+        : parsed.data.materials;
 
       const created = await ProjectModel.create({
         factoryId: req.factoryId,
         code: code.toUpperCase(),
         ...parsed.data,
+        materials,
         delivery: parsed.data.delivery
           ? new Date(parsed.data.delivery)
           : undefined,
@@ -525,8 +644,33 @@ projectsRoutes.post(
     );
     const stageStatus = parsed.data.stageStatus?.trim();
     const hasStatusUpdate = Boolean(stageStatus);
-    const stockDeductions = new Map<string, number>();
     const hasMaterialUsage = parsed.data.materials.length > 0;
+    const todayRange = dayBounds();
+    const currentUsageHistory = [...(stages[stageIndex].usageHistory ?? [])];
+    const matchedUsageRecords = currentUsageHistory.filter((entry: any) =>
+      isSameDayUsageRecord(entry, {
+        userId: req.user?.id,
+        staffName: parsed.data.staffName,
+        start: todayRange.start,
+        end: todayRange.end,
+      }),
+    );
+    const existingUsageRecord = matchedUsageRecords[0] ?? null;
+    const matchedUsageIds = new Set(
+      matchedUsageRecords.map((entry: any) => String(entry.id || "")).filter(Boolean),
+    );
+    const existingUsageByMaterial = new Map<string, number>();
+    for (const record of matchedUsageRecords) {
+      for (const material of (record?.materials ?? []) as any[]) {
+        const materialId = String(material.projectMaterialId);
+        existingUsageByMaterial.set(
+          materialId,
+          (existingUsageByMaterial.get(materialId) ?? 0) +
+            Number(material.quantityUsed ?? 0),
+        );
+      }
+    }
+    const stockAdjustments = new Map<string, number>();
 
     if (!hasMaterialUsage && !hasStatusUpdate && !parsed.data.note?.trim()) {
       return fail(
@@ -551,29 +695,41 @@ projectsRoutes.post(
       );
 
     for (const material of stageMaterials) {
-      const quantityUsed =
-        usageByMaterial.get(String(material.projectMaterialId)) ?? 0;
-      if (!quantityUsed) continue;
-      const remaining =
-        Number(material.requiredQuantity ?? 0) -
-        Number(material.completedQuantity ?? 0);
-      if (quantityUsed > remaining) {
+      const materialId = String(material.projectMaterialId);
+      const nextUsage = usageByMaterial.get(materialId);
+      if (nextUsage === undefined) continue;
+      const previousUsage = existingUsageByMaterial.get(materialId) ?? 0;
+      const nextCompletedQuantity =
+        Number(material.completedQuantity ?? 0) - previousUsage + nextUsage;
+      if (nextCompletedQuantity < 0) {
+        return fail(
+          res,
+          400,
+          `${material.materialName || "Material"} usage cannot be below 0 ${material.unit || "units"}`,
+        );
+      }
+      if (nextCompletedQuantity > Number(material.requiredQuantity ?? 0)) {
+        const remaining =
+          Number(material.requiredQuantity ?? 0) -
+          (Number(material.completedQuantity ?? 0) - previousUsage);
         return fail(
           res,
           400,
           `${material.materialName || "Material"} usage cannot exceed the remaining ${remaining} ${material.unit || "units"}`,
         );
       }
+      const stockDelta = nextUsage - previousUsage;
       if (material.stockItemId) {
         const stockId = String(material.stockItemId);
-        stockDeductions.set(
+        stockAdjustments.set(
           stockId,
-          (stockDeductions.get(stockId) ?? 0) + quantityUsed,
+          (stockAdjustments.get(stockId) ?? 0) + stockDelta,
         );
       }
     }
 
-    for (const [stockId, quantity] of stockDeductions) {
+    for (const [stockId, quantity] of stockAdjustments) {
+      if (quantity <= 0) continue;
       const stock = await StockModel.findOne({
         _id: stockId,
         ...projectFilter(req),
@@ -594,16 +750,20 @@ projectsRoutes.post(
       );
       if (materialIndex < 0) continue;
       const material = stageMaterials[materialIndex];
+      const previousUsage =
+        existingUsageByMaterial.get(String(usage.projectMaterialId)) ?? 0;
       stageMaterials[materialIndex] = {
         ...material,
         completedQuantity:
-          Number(material.completedQuantity ?? 0) + usage.quantityUsed,
+          Number(material.completedQuantity ?? 0) - previousUsage + usage.quantityUsed,
       };
     }
 
-    if (stockDeductions.size) {
+    if (stockAdjustments.size) {
       await StockModel.bulkWrite(
-        [...stockDeductions].map(([stockId, quantity]) => ({
+        [...stockAdjustments]
+          .filter(([, quantity]) => quantity !== 0)
+          .map(([stockId, quantity]) => ({
           updateOne: {
             filter: { _id: stockId, ...projectFilter(req) },
             update: { $inc: { quantity: -quantity } },
@@ -612,36 +772,69 @@ projectsRoutes.post(
       );
     }
 
+    const mergedMaterials = new Map(
+      ((existingUsageRecord?.materials ?? []) as any[]).map((material) => [
+        String(material.projectMaterialId),
+        {
+          projectMaterialId: String(material.projectMaterialId),
+          materialName: material.materialName ?? "Material",
+          materialType: material.materialType ?? "",
+          thickness: material.thickness ?? "",
+          quantityUsed: Number(material.quantityUsed ?? 0),
+          unit: material.unit ?? "units",
+        },
+      ]),
+    );
+    for (const usage of parsed.data.materials) {
+      const material = stageMaterials.find(
+        (item) => String(item.projectMaterialId) === usage.projectMaterialId,
+      );
+      mergedMaterials.set(String(usage.projectMaterialId), {
+        projectMaterialId: usage.projectMaterialId,
+        materialName: material?.materialName ?? "Material",
+        materialType: material?.materialType ?? "",
+        thickness: material?.thickness ?? "",
+        quantityUsed: usage.quantityUsed,
+        unit: material?.unit ?? "units",
+      });
+    }
+    const usageMaterials = [...mergedMaterials.values()].filter(
+      (material) => Number(material.quantityUsed ?? 0) > 0,
+    );
     const usageRecord = {
-      id: `usage-${Date.now()}`,
+      id: existingUsageRecord?.id ?? `usage-${Date.now()}`,
       userId: req.user?.id,
       role: parsed.data.role,
       staffName: parsed.data.staffName,
-      note: parsed.data.note,
-      stageStatus: stageStatus || undefined,
-      createdAt: new Date(),
-      materials: parsed.data.materials.map((usage) => {
-        const material = stageMaterials.find(
-          (item) => String(item.projectMaterialId) === usage.projectMaterialId,
-        );
-        return {
-          projectMaterialId: usage.projectMaterialId,
-          materialName: material?.materialName ?? "Material",
-          materialType: material?.materialType ?? "",
-          thickness: material?.thickness ?? "",
-          quantityUsed: usage.quantityUsed,
-          unit: material?.unit ?? "units",
-        };
-      }),
+      note:
+        parsed.data.note !== undefined
+          ? parsed.data.note
+          : existingUsageRecord?.note,
+      stageStatus: stageStatus || existingUsageRecord?.stageStatus || undefined,
+      createdAt: existingUsageRecord?.createdAt
+        ? new Date(existingUsageRecord.createdAt)
+        : new Date(),
+      materials: usageMaterials,
     };
     const totals = stageTotals(stageMaterials);
+    const nextUsageHistory =
+      usageMaterials.length === 0
+        ? currentUsageHistory.filter(
+            (entry: any) => !matchedUsageIds.has(String(entry?.id || "")),
+          )
+        : [
+            usageRecord,
+            ...currentUsageHistory.filter(
+              (entry: any) => !matchedUsageIds.has(String(entry?.id || "")),
+            ),
+          ];
 
     stages[stageIndex] = {
       ...stages[stageIndex],
       materials: stageMaterials,
       ...totals,
       staffStatus: stageStatus || stages[stageIndex].staffStatus || "In progress",
-      usageHistory: [usageRecord, ...(stages[stageIndex].usageHistory ?? [])],
+      usageHistory: nextUsageHistory,
       lastUpdate: usageRecord,
     };
     project.workflowStages = stages;
@@ -659,33 +852,49 @@ projectsRoutes.post(
       userId: req.user?.id,
       staffName: parsed.data.staffName,
     });
-    await StaffUsageLogModel.findOneAndUpdate(
-      {
+    if (usageRecord.materials.length) {
+      await StaffUsageLogModel.findOneAndUpdate(
+        {
+          factoryId: req.factoryId,
+          sourceRecordId: usageRecord.id,
+        },
+        {
+          factoryId: req.factoryId,
+          staffId: staffContext?._id,
+          userId: req.user?.id,
+          staffName: parsed.data.staffName || staffContext?.name || "Staff",
+          staffEmail: staffContext?.email || "",
+          staffRole: parsed.data.role || staffContext?.role || "",
+          projectId: project._id,
+          projectCode: project.code,
+          projectName: project.name,
+          stageName,
+          note: usageRecord.note || "",
+          totalQuantityUsed: usageRecord.materials.reduce(
+            (sum, material) => sum + Number(material.quantityUsed ?? 0),
+            0,
+          ),
+          sourceRecordId: usageRecord.id,
+          activityAt: usageRecord.createdAt,
+          materials: usageRecord.materials,
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      );
+      const duplicateSourceRecordIds = [...matchedUsageIds].filter(
+        (sourceRecordId) => sourceRecordId !== usageRecord.id,
+      );
+      if (duplicateSourceRecordIds.length) {
+        await StaffUsageLogModel.deleteMany({
+          factoryId: req.factoryId,
+          sourceRecordId: { $in: duplicateSourceRecordIds },
+        });
+      }
+    } else if (matchedUsageIds.size) {
+      await StaffUsageLogModel.deleteMany({
         factoryId: req.factoryId,
-        sourceRecordId: usageRecord.id,
-      },
-      {
-        factoryId: req.factoryId,
-        staffId: staffContext?._id,
-        userId: req.user?.id,
-        staffName: parsed.data.staffName || staffContext?.name || "Staff",
-        staffEmail: staffContext?.email || "",
-        staffRole: parsed.data.role || staffContext?.role || "",
-        projectId: project._id,
-        projectCode: project.code,
-        projectName: project.name,
-        stageName,
-        note: parsed.data.note || "",
-        totalQuantityUsed: usageRecord.materials.reduce(
-          (sum, material) => sum + Number(material.quantityUsed ?? 0),
-          0,
-        ),
-        sourceRecordId: usageRecord.id,
-        activityAt: usageRecord.createdAt,
-        materials: usageRecord.materials,
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
-    );
+        sourceRecordId: { $in: [...matchedUsageIds] },
+      });
+    }
     ok(res, mapProject(project, req.user?.id), "Project usage updated");
   },
 );
