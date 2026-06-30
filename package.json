@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
-    "lint": "eslint src --ext .ts"
+    "dev": "nodemon --watch src --ext js --exec node src/server.js",
+    "build": "eslint src --ext .js",
+    "start": "node src/server.js",
+    "lint": "eslint src --ext .js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -18,13 +18,7 @@
     "zod": "^4.0.17"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.3",
-    "@types/jsonwebtoken": "^9.0.10",
-    "@types/node": "^20.0.0",
     "eslint": "^9.32.0",
-    "nodemon": "^3.1.14",
-    "tsx": "^4.20.3",
-    "typescript": "^5.9.2"
+    "nodemon": "^3.1.14"
   }
 }
