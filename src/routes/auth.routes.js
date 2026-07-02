@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { ok, fail } from "../utils/api-response.js";
-import { buildSessionForUser, hasGoogleAuthConfigured, StaffAccessNotAssignedError, upsertGoogleUser, verifyGoogleCredential, } from "../services/auth.service.js";
+import { AccountDeactivatedError, buildSessionForUser, hasGoogleAuthConfigured, StaffAccessNotAssignedError, upsertGoogleUser, verifyGoogleCredential, } from "../services/auth.service.js";
 import { FactoryModel } from "../models/factory.model.js";
 import { FULL_PAGE_PERMISSIONS } from "../models/membership.model.js";
 import { UserModel } from "../models/user.model.js";
@@ -11,6 +11,9 @@ import { requireAuth } from "../middleware/auth.middleware.js";
 export const authRoutes = Router();
 const googleLoginSchema = z.object({
     credential: z.string().min(1),
+});
+const deleteAccountSchema = z.object({
+    reason: z.string().trim().max(500).optional().nullable(),
 });
 authRoutes.post("/google", async (req, res) => {
     if (!hasGoogleAuthConfigured()) {
@@ -54,7 +57,7 @@ authRoutes.post("/google", async (req, res) => {
     }
     catch (error) {
         console.error("Google login failed", error);
-        return fail(res, error instanceof StaffAccessNotAssignedError ? error.status : 401, error instanceof Error ? error.message : "Login failed");
+        return fail(res, error instanceof StaffAccessNotAssignedError || error instanceof AccountDeactivatedError ? error.status : 401, error instanceof Error ? error.message : "Login failed");
     }
 });
 authRoutes.get("/me", requireAuth, async (req, res) => {
@@ -66,9 +69,56 @@ authRoutes.get("/me", requireAuth, async (req, res) => {
         ok(res, session);
     }
     catch (error) {
-        fail(res, error instanceof StaffAccessNotAssignedError ? error.status : 500, error instanceof Error ? error.message : "Unable to load session");
+        fail(res, error instanceof StaffAccessNotAssignedError || error instanceof AccountDeactivatedError ? error.status : 500, error instanceof Error ? error.message : "Unable to load session");
     }
 });
 authRoutes.post("/logout", (_req, res) => {
     ok(res, { message: "Logged out" });
+});
+authRoutes.delete("/account", requireAuth, async (req, res) => {
+    const parsed = deleteAccountSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+        return fail(res, 400, "Invalid delete account payload");
+    }
+    try {
+        const user = await UserModel.findById(req.user?.id);
+        if (!user || user.active !== true) {
+            return fail(res, 404, "User not found");
+        }
+        if (user.globalRole === "staff" || user.factoryRole === "staff") {
+            return fail(res, 403, "Staff accounts cannot use self-delete");
+        }
+        const deletionReason = parsed.data.reason || "Self deleted";
+        if (user.factoryId && user.factoryRole === "admin" && user.globalRole !== "super_admin") {
+            await UserModel.updateMany(
+                { factoryId: user.factoryId, active: true },
+                {
+                    $set: {
+                        active: false,
+                        deletedAt: new Date(),
+                        deletedBy: user._id,
+                        deletionReason,
+                    },
+                },
+            );
+            await FactoryModel.findByIdAndUpdate(user.factoryId, {
+                status: "inactive",
+                updatedBy: user._id,
+            });
+            return ok(
+                res,
+                { success: true, scope: "factory" },
+                "Factory admin account deleted successfully. All factory users were deactivated.",
+            );
+        }
+        user.active = false;
+        user.deletedAt = new Date();
+        user.deletedBy = user._id;
+        user.deletionReason = deletionReason;
+        await user.save();
+        ok(res, { success: true }, "Account deleted successfully");
+    }
+    catch (error) {
+        fail(res, 500, error instanceof Error ? error.message : "Unable to delete account");
+    }
 });

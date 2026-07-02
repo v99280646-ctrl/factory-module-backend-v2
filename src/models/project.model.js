@@ -15,7 +15,7 @@ const projectSchema = new Schema({
     status: {
         type: String,
         default: "ongoing",
-        enum: ["ongoing", "hold", "completed", "cancelled"],
+        enum: ["ongoing", "hold", "delivered", "completed", "cancelled"],
     },
     progress: { type: Number, default: 0, min: 0, max: 100 },
     delivery: { type: Date },

@@ -14,6 +14,13 @@ export class StaffAccessNotAssignedError extends Error {
         this.name = "StaffAccessNotAssignedError";
     }
 }
+export class AccountDeactivatedError extends Error {
+    status = 403;
+    constructor() {
+        super("This account has been deactivated. Contact support or a super admin.");
+        this.name = "AccountDeactivatedError";
+    }
+}
 function signToken(payload) {
     if (!env.jwtSecret) {
         throw new Error("JWT_SECRET is missing");
@@ -89,6 +96,9 @@ export async function buildSessionForUser(userId, isNewUser = false) {
     if (!user) {
         throw new Error("User not found");
     }
+    if (user.active !== true) {
+        throw new AccountDeactivatedError();
+    }
     if (user.globalRole !== "super_admin" && !user.factoryId) {
         throw new StaffAccessNotAssignedError(user.email);
     }
@@ -129,6 +139,31 @@ export async function upsertGoogleUser(input) {
         const targetRole = isSuperAdminEmail(email) ? "super_admin" : "admin";
         console.log("targetRole", targetRole);
         if (existing) {
+            if (existing.active !== true) {
+                existing.name = input.name;
+                if (input.googleId)
+                    existing.googleId = input.googleId;
+                if (existing.globalRole === "super_admin") {
+                    existing.active = true;
+                    existing.factoryId = null;
+                    existing.factoryRole = null;
+                    existing.deletedAt = null;
+                    existing.deletedBy = null;
+                    existing.deletionReason = "";
+                    await existing.save();
+                }
+                else if (existing.globalRole === "admin") {
+                    existing.active = true;
+                    existing.factoryId = null;
+                    existing.factoryRole = "admin";
+                    existing.pagePermissions = FULL_PAGE_PERMISSIONS;
+                    existing.deletedAt = null;
+                    existing.deletedBy = null;
+                    existing.deletionReason = "";
+                    await existing.save();
+                }
+                return { user: existing, isNewUser: false };
+            }
             existing.name = input.name;
             if (input.googleId)
                 existing.googleId = input.googleId;
@@ -139,7 +174,6 @@ export async function upsertGoogleUser(input) {
                 existing.factoryRole =
                     existing.globalRole === "admin" ? "admin" : "staff";
             }
-            existing.active = true;
             await existing.save();
             return { user: existing, isNewUser: false };
         }

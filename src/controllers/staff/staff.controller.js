@@ -99,6 +99,20 @@ function routeParam(value) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function buildEmailConflictMessage(user) {
+  if (!user) return "This email is already used by another account";
+  if (user.globalRole === "super_admin") {
+    return "This email already belongs to a super admin account";
+  }
+  if (user.factoryRole === "admin" || user.globalRole === "admin") {
+    return "This email already belongs to a factory admin account";
+  }
+  if (user.active !== true) {
+    return "This email belongs to a deleted or inactive account. Re-add that team member using this email instead of updating another account to it.";
+  }
+  return "This email is already used by another account";
+}
+
 async function backfillUsageLogsForUser(user, factoryId) {
   if (!factoryId) return;
   const targetUserId = String(user._id);
@@ -523,16 +537,27 @@ export async function handleCreateStaff(req, res) {
     if (existingUser && existingUser.globalRole === "super_admin") {
       return fail(res, 400, "This email already belongs to a super admin account");
     }
-    if (existingUser?.factoryId && String(existingUser.factoryId) !== String(factoryId)) {
+    if (
+      existingUser?.active === true &&
+      existingUser?.factoryId &&
+      String(existingUser.factoryId) !== String(factoryId)
+    ) {
       return fail(res, 400, "This user already belongs to another factory");
     }
-    if (existingUser && (existingUser.factoryRole === "admin" || existingUser.globalRole === "admin")) {
+    if (
+      existingUser?.active === true &&
+      (existingUser.factoryRole === "admin" || existingUser.globalRole === "admin")
+    ) {
       return fail(res, 400, "This email already belongs to a factory admin account");
     }
 
     const nextEmployeeRole = parsed.data.employeeRole ?? parsed.data.role;
     const nextActive = parsed.data.active !== false;
-    if (req.user?.globalRole !== "super_admin" && nextActive && (!existingUser || existingUser.active !== true)) {
+    if (
+      req.user?.globalRole !== "super_admin" &&
+      nextActive &&
+      (!existingUser || existingUser.active !== true)
+    ) {
       const limitCheck = await assertFactoryFeatureLimit(factoryId, "staff");
       if (!limitCheck.allowed) {
         return fail(res, 403, limitCheck.state.message || "Staff limit reached");
@@ -541,7 +566,7 @@ export async function handleCreateStaff(req, res) {
 
     const user =
       existingUser ??
-      (await UserModel.create({
+      new UserModel({
         name: parsed.data.name,
         email,
         globalRole: "staff",
@@ -551,7 +576,7 @@ export async function handleCreateStaff(req, res) {
         phone: parsed.data.phone || "",
         pagePermissions,
         active: nextActive,
-      }));
+      });
 
     user.name = parsed.data.name;
     user.email = email;
@@ -562,6 +587,9 @@ export async function handleCreateStaff(req, res) {
     user.phone = parsed.data.phone || "";
     user.pagePermissions = pagePermissions;
     user.active = nextActive;
+    user.deletedAt = null;
+    user.deletedBy = null;
+    user.deletionReason = "";
     await user.save();
 
     ok(res, mapStaff(user), "Staff created");
@@ -598,8 +626,8 @@ export async function handleUpdateStaff(req, res) {
     const email =
       parsed.data.email !== undefined ? normalizeEmail(parsed.data.email) : normalizeEmail(user.email);
     if (email) {
-      const emailConflict = await UserModel.findOne({ email, _id: { $ne: user._id } }).lean();
-      if (emailConflict) return fail(res, 400, "This email is already used by another account");
+      const emailConflict = await UserModel.findOne({ email,active: true, _id: { $ne: user._id } }).lean();
+      if (emailConflict) return fail(res, 400, buildEmailConflictMessage(emailConflict));
     }
 
     const nextEmployeeRole =
@@ -622,6 +650,13 @@ export async function handleUpdateStaff(req, res) {
           : {}),
         ...(parsed.data.pagePermissions !== undefined ? { pagePermissions: nextPagePermissions } : {}),
         ...(parsed.data.active !== undefined ? { active: parsed.data.active } : {}),
+        ...(parsed.data.active === true
+          ? {
+              deletedAt: null,
+              deletedBy: null,
+              deletionReason: "",
+            }
+          : {}),
         updatedBy: req.user?.id,
       },
       { new: true },
@@ -641,7 +676,13 @@ export async function handleDeleteStaff(req, res) {
 
     const updated = await UserModel.findByIdAndUpdate(
       user._id,
-      { active: false, updatedBy: req.user?.id },
+      {
+        active: false,
+        deletedAt: new Date(),
+        deletedBy: req.user?.id,
+        deletionReason: "Deleted by factory admin",
+        updatedBy: req.user?.id,
+      },
       { new: true },
     ).lean();
     if (!updated) return fail(res, 404, "Staff not found");

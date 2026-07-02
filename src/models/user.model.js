@@ -10,9 +10,9 @@ const pagePermissionSchema = new Schema(PAGE_NAMES.reduce((acc, page) => {
 }, {}), { _id: false });
 const userSchema = new Schema({
     name: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, trim: true, lowercase: true },
+    email: { type: String, required: true, trim: true, lowercase: true },
     passwordHash: { type: String },
-    googleId: { type: String, unique: true, sparse: true },
+    googleId: { type: String, sparse: true },
     factoryId: { type: Schema.Types.ObjectId, ref: "Factory", default: null, index: true },
     globalRole: {
         type: String,
@@ -33,6 +33,9 @@ const userSchema = new Schema({
     phone: { type: String, trim: true, default: "" },
     pagePermissions: { type: pagePermissionSchema, default: {} },
     active: { type: Boolean, default: true },
+    deletedAt: { type: Date, default: null },
+    deletedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    deletionReason: { type: String, trim: true, default: "" },
 }, { timestamps: true });
 userSchema.index({ factoryId: 1, factoryRole: 1, active: 1 });
 export const UserModel = model("User", userSchema);

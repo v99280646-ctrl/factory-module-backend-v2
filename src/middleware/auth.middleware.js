@@ -1,6 +1,7 @@
 import { fail } from "../utils/api-response.js";
 import { decodeBearerToken } from "../services/auth.service.js";
-export function requireAuth(req, res, next) {
+import { UserModel } from "../models/user.model.js";
+export async function requireAuth(req, res, next) {
     const header = req.header("Authorization");
     if (!header?.startsWith("Bearer ")) {
         return fail(res, 401, "Unauthorized");
@@ -12,6 +13,16 @@ export function requireAuth(req, res, next) {
             email: "",
             globalRole: payload.globalRole,
             factoryId: payload.factoryId ?? null,
+        };
+        const user = await UserModel.findById(payload.userId).select("_id email globalRole factoryId active").lean();
+        if (!user || user.active !== true) {
+            return fail(res, 403, "Account is inactive");
+        }
+        req.user = {
+            id: String(user._id),
+            email: user.email || "",
+            globalRole: user.globalRole,
+            factoryId: user.factoryId ? String(user.factoryId) : null,
         };
     }
     catch {
